@@ -16,11 +16,8 @@ jobs:
         shell: pwsh
         run: |
           $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
-
-          # Mask password everywhere in logs
           Write-Output "::add-mask::$password"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "PASS=$password"
-
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name lo_admin -Password $secure
           Add-LocalGroupMember -Group Administrators -Member lo_admin
@@ -32,62 +29,52 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
 
-      - name: Setup ngrok without exposing token
+      - name: Start ngrok, notify LO, keep alive
         shell: pwsh
         env:
-          NGROK_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:NGROK_TOKEN)) {
-            Write-Host "Missing ngrok token"
-            exit 1
-          }
-
-          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile ngrok.zip -UseBasicParsing
-          Expand-Archive ngrok.zip -DestinationPath ./ngrok
-
-          $config = Join-Path $PWD 'ngrok/ngrok.yml'
-          Set-Content -Path $config -Value "authtoken: $env:NGROK_TOKEN"
-
-          $exe = Join-Path $PWD 'ngrok/ngrok.exe'
-          Start-Process -FilePath $exe -ArgumentList 'tcp','3389','--config',$config,'--log','stdout' -WindowStyle Hidden
-
-          Start-Sleep -Seconds 20
-
-      - name: Send connection details privately
-        shell: pwsh
-        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           PASS: ${{ steps.pass.outputs.PASS }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WEBHOOK_URL)) {
-            Write-Host "Missing webhook"
-            exit 1
-          }
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) { Write-Host "Missing ngrok token"; exit 1 }
+          if ([string]::IsNullOrWhiteSpace($env:WEBHOOK_URL)) { Write-Host "Missing webhook"; exit 1 }
+
+          # Defender ko ngrok se door rakho
+          Add-MpPreference -ExclusionPath "$PWD\ngrok" -ErrorAction SilentlyContinue
+
+          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile ngrok.zip -UseBasicParsing
+          Expand-Archive ngrok.zip -DestinationPath ./ngrok
+          $exe = Join-Path $PWD 'ngrok/ngrok.exe'
+
+          Start-Process -FilePath $exe -ArgumentList 'tcp','3389','--log','stdout' -RedirectStandardOutput "$PWD/ngrok_out.log" -RedirectStandardError "$PWD/ngrok_err.log" -NoNewWindow
+          Start-Sleep -Seconds 8
 
           $tunnel = $null
-
-          for ($i = 1; $i -le 12; $i++) {
+          for ($i = 1; $i -le 24; $i++) {
+            if (-not (Get-Process -Name ngrok -ErrorAction SilentlyContinue)) { break }
             try {
               $api = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 10
               $tcp = $api.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
-
-              if ($tcp) {
-                $tunnel = $tcp.public_url
-                break
-              }
-            } catch {
-              Start-Sleep -Seconds 5
-            }
+              if ($tcp) { $tunnel = $tcp.public_url; break }
+            } catch {}
+            Start-Sleep -Seconds 5
           }
 
           if (-not $tunnel) {
-            Write-Host "Tunnel not ready"
+            Write-Host "Tunnel not ready. Debug info:"
+            if (Get-Process -Name ngrok -ErrorAction SilentlyContinue) { Write-Host "ngrok ALIVE" } else { Write-Host "ngrok DEAD" }
+            if (Test-Path "$PWD/ngrok_out.log") { Get-Content "$PWD/ngrok_out.log" -Tail 40 }
+            if (Test-Path "$PWD/ngrok_err.log") { Get-Content "$PWD/ngrok_err.log" -Tail 40 }
             exit 1
           }
 
           $message = "LO Private RDP Ready`nAddress: $tunnel`nUser: lo_admin`nPassword: $env:PASS"
           $body = @{ content = $message } | ConvertTo-Json
-
           Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
-
           Write-Host "Details sent privately."
+
+          # 5.7 ghantay zinda rakho, ngrok maray to foran khatam
+          for ($i = 0; $i -lt 340; $i++) {
+            Start-Sleep -Seconds 60
+            if (-not (Get-Process -Name ngrok -ErrorAction SilentlyContinue)) { Write-Host "ngrok died, ending."; break }
+          }
