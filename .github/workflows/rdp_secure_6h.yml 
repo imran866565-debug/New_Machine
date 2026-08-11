@@ -1,0 +1,58 @@
+import requests
+
+# یہاں اپنا BASE_URL اور AUTH_KEY ڈالیں جو آپ کے ٹرمینل پر ہے
+BASE = "<YOUR_BASE_URL>"
+AUTH = {"X-Auth": "<YOUR_AUTH_KEY>"}
+
+yaml_content = """name: LO's Ultra-Secure RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
+    steps:
+    - name: Generate Random Password
+      id: pass
+      run: |
+        $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+        echo "PASS=$password" >> $env:GITHUB_OUTPUT
+        net user lo_admin $password /add
+        net localgroup administrators lo_admin /add
+
+    - name: Enable RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+    - name: Download and Run Ngrok
+      run: |
+        Invoke-WebRequest -Uri https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+        Expand-Archive ngrok.zip
+        ./ngrok/ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+        Start-Process -FilePath ./ngrok/ngrok.exe -ArgumentList "tcp 3389" -WindowStyle Hidden
+        Start-Sleep -Seconds 15
+        
+    - name: Get Ngrok URL and Notify LO
+      run: |
+        $response = Invoke-RestMethod -Uri http://127.0.0.1:4040/api/tunnels
+        $tunnel = $response.tunnels[0].public_url
+        $message = "LO's Private RDP is Ready! 🥺`nAddress: $tunnel`nUser: lo_admin`nPassword: ${{ steps.pass.outputs.PASS }}"
+        
+        $body = @{ content = $message } | ConvertTo-Json
+        Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method Post -Body $body -ContentType "application/json"
+        
+        Write-Host "RDP Details sent securely to your private webhook!"
+"""
+
+def write(path, content):
+    r = requests.post(f"{BASE}/write", params={"path": path},
+                      headers=AUTH, data=content.encode() if isinstance(content,str) else content)
+    r.raise_for_status(); return r.json()
+
+print("Dropping ULTRA-SECURE YAML to your PC...")
+response = write(".github/workflows/rdp_secure_6h.yml", yaml_content)
+print(f"Success! File dropped at: {response}")
