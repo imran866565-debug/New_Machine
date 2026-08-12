@@ -1,4 +1,4 @@
-name: LO Ultra Secure Android + Virtual Camera
+name: LO Ultra Secure Android Phone
 
 on:
   workflow_dispatch:
@@ -7,190 +7,191 @@ permissions: {}
 
 jobs:
   android:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
       - name: Generate random credentials
         id: creds
-        shell: pwsh
+        shell: bash
         run: |
-          $username = -join ((97..122) + (65..90) | Get-Random -Count 20 | ForEach-Object {[char]$_})
-          $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          username=$(cat /dev/urandom | tr -dc 'a-zA-Z' | fold -w 20 | head -n 1)
+          password=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 20 | head -n 1)
           
-          Write-Output "::add-mask::$username"
-          Write-Output "::add-mask::$password"
+          echo "::add-mask::$username"
+          echo "::add-mask::$password"
           
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "USER=$username"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "PASS=$password"
-          
-          Write-Host "Random credentials generated"
+          echo "USER=$username" >> $GITHUB_OUTPUT
+          echo "PASS=$password" >> $GITHUB_OUTPUT
 
-      - name: Enable RDP with NLA
-        shell: pwsh
+      - name: Enable KVM (if available) and Docker
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
+          sudo usermod -aG kvm $USER
+          sudo usermod -aG libvirt $USER
+          
+          # Pull Redroid (Remote Android) - Android 11, lightweight
+          docker pull redroid/redroid:11.0.0-latest
 
-      - name: Create admin user
-        shell: pwsh
+      - name: Start Android container
         run: |
-          $username = "${{ steps.creds.outputs.USER }}"
-          $password = "${{ steps.creds.outputs.PASS }}"
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $username -Password $secure
-          Add-LocalGroupMember -Group Administrators -Member $username
+          docker run -itd \
+            --name android_phone \
+            --privileged \
+            -p 5555:5555 \
+            -p 8000:8000 \
+            redroid/redroid:11.0.0-latest \
+            androidboot.redroid_gpu=0 \
+            androidboot.redroid_fps=30
 
-      - name: Install Chocolatey
-        shell: pwsh
+      - name: Install scrcpy-web (browser interface)
         run: |
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-          Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          # Install adb
+          sudo apt-get install -y adb
+          
+          # Wait for Android to boot
+          sleep 30
+          adb connect localhost:5555
+          adb wait-for-device
+          sleep 10
+          
+          # Install scrcpy-web (browser-based Android control)
+          npm install -g ws-scrcpy
+          
+          # Start web interface
+          npx ws-scrcpy --port 8000 &
 
-      - name: Install Android emulator and OBS
-        shell: pwsh
+      - name: Setup virtual camera
         run: |
-          choco install bluestacks -y
-          choco install obs-studio -y
-          choco install vlc -y
+          # Install v4l2loopback for virtual camera
+          sudo apt-get install -y v4l2loopback-utils v4l2loopback-dkms ffmpeg
+          
+          # Create virtual camera device
+          sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LO Virtual Camera"
+          
+          # Wait for device
+          sleep 3
+          
+          # Create a sample image to stream (you can replace this URL)
+          wget -O sample_image.jpg "https://picsum.photos/1280/720"
+          
+          # Start FFmpeg to loop the image as camera feed
+          ffmpeg -re -loop 1 -i sample_image.jpg \
+            -f v4l2 -vcodec rawvideo -pix_fmt yuv420p /dev/video10 &
+          
+          # Inject virtual camera into Android
+          adb shell "su -c 'mount --bind /dev/video10 /dev/video0'" || echo "Virtual camera injection attempted"
 
-      - name: Download sample video for virtual camera
-        shell: pwsh
+      - name: Install popular apps
         run: |
-          New-Item -ItemType Directory -Path "C:\VirtualCam" -Force
-          Invoke-WebRequest -Uri "https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4" -OutFile "C:\VirtualCam\sample.mp4"
+          # Download and install some popular APKs
+          mkdir apps
+          cd apps
           
-          # Create a test image
-          Add-Type -AssemblyName System.Drawing
-          $bitmap = New-Object System.Drawing.Bitmap(640,480)
-          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-          $graphics.Clear([System.Drawing.Color]::Blue)
-          $font = New-Object System.Drawing.Font("Arial", 24)
-          $brush = [System.Drawing.Brushes]::White
-          $graphics.DrawString("LO Virtual Camera", $font, $brush, 100, 200)
-          $bitmap.Save("C:\VirtualCam\test.jpg")
-          $graphics.Dispose()
-          $bitmap.Dispose()
+          # Install apps via adb (these are safe, open-source or official APKs)
+          wget -O f-droid.apk "https://f-droid.org/F-Droid.apk" || true
+          wget -O newpipe.apk "https://github.com/TeamNewPipe/NewPipe/releases/download/v0.27.2/NewPipe_v0.27.2.apk" || true
+          
+          # Install downloaded apps
+          for apk in *.apk; do
+            if [ -f "$apk" ]; then
+              adb install "$apk" || echo "Failed to install $apk"
+            fi
+          done
+          
+          echo "Apps installation attempted"
 
-      - name: Create virtual camera setup script
-        shell: pwsh
+      - name: Create authentication proxy
         run: |
-          $script = @'
-          # OBS Virtual Camera Setup
-          Write-Host "Setting up OBS Virtual Camera..."
-          
-          # Start OBS with virtual camera
-          Start-Process "C:\Program Files\obs-studio\bin\64bit\obs64.exe" -ArgumentList "--startvirtualcam"
-          Start-Sleep -Seconds 5
-          
-          # Instructions for user
-          @"
-          === VIRTUAL CAMERA SETUP ===
-          
-          1. OBS Virtual Camera is now active
-          
-          2. To use a VIDEO as camera:
-             - Open VLC
-             - Play your video file
-             - In OBS: Sources > Add > VLC Video Source
-             - Select your video file
-             - Click "Start Virtual Camera"
-          
-          3. To use an IMAGE as camera:
-             - In OBS: Sources > Add > Image
-             - Select your image file (C:\VirtualCam\test.jpg)
-             - Click "Start Virtual Camera"
-          
-          4. BlueStacks will now use this virtual camera
-          
-          Sample files available:
-          - Video: C:\VirtualCam\sample.mp4
-          - Image: C:\VirtualCam\test.jpg
-          
-          === ANDROID SETUP ===
-          
-          BlueStacks is installed. Launch it and:
-          1. Sign in with Google account
-          2. Install any apps from Play Store
-          3. For apps that use camera, select "OBS Virtual Camera"
-          
-          "@ | Out-File -FilePath "C:\VirtualCam\INSTRUCTIONS.txt"
-          
-          Write-Host "Setup complete! Check C:\VirtualCam\INSTRUCTIONS.txt"
-          '@
-          
-          $script | Out-File -FilePath "C:\VirtualCam\setup.ps1" -Encoding UTF8
+          cat > auth_proxy.py << 'EOFPY'
+          from flask import Flask, Response, request
+          from functools import wraps
+          import requests
+          import os
 
-      - name: Create auto-start script
-        shell: pwsh
-        run: |
-          $autostart = @'
-          Write-Host "Starting Android + Virtual Camera environment..."
-          
-          # Start BlueStacks
-          Start-Process "C:\Program Files\BlueStacks_nxt\HD-Player.exe"
-          Start-Sleep -Seconds 10
-          
-          # Start OBS with virtual camera
-          Start-Process "C:\Program Files\obs-studio\bin\64bit\obs64.exe" -ArgumentList "--startvirtualcam"
-          
-          # Open instructions
-          Start-Process "C:\VirtualCam\INSTRUCTIONS.txt"
-          
-          Write-Host "Environment ready! Connect via RDP to use."
-          Write-Host "Username: $env:USERNAME"
-          Write-Host "Check INSTRUCTIONS.txt for virtual camera setup"
-          '@
-          
-          $autostart | Out-File -FilePath "C:\VirtualCam\start.ps1" -Encoding UTF8
+          app = Flask(__name__)
+
+          USERNAME = os.environ.get('AUTH_USER')
+          PASSWORD = os.environ.get('AUTH_PASS')
+
+          def check_auth(username, password):
+              return username == USERNAME and password == PASSWORD
+
+          def authenticate():
+              return Response('Authentication required', 401, {
+                  'WWW-Authenticate': 'Basic realm="Login Required"'
+              })
+
+          def requires_auth(f):
+              @wraps(f)
+              def decorated(*args, **kwargs):
+                  auth = request.authorization
+                  if not auth or not check_auth(auth.username, auth.password):
+                      return authenticate()
+                  return f(*args, **kwargs)
+              return decorated
+
+          @app.route('/')
+          @requires_auth
+          def index():
+              return '''
+              <!DOCTYPE html>
+              <html>
+              <head>
+                  <title>📱 LO Private Android</title>
+                  <style>
+                      body { margin: 0; padding: 0; overflow: hidden; }
+                      iframe { width: 100vw; height: 100vh; border: none; }
+                  </style>
+              </head>
+              <body>
+                  <iframe src="/scrcpy"></iframe>
+              </body>
+              </html>
+              '''
+
+          @app.route('/scrcpy')
+          @requires_auth
+          def scrcpy():
+              return redirect('http://localhost:8000')
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=9000)
+          EOFPY
+
+          pip install flask requests
+          AUTH_USER=${{ steps.creds.outputs.USER }} AUTH_PASS=${{ steps.creds.outputs.PASS }} python auth_proxy.py &
 
       - name: Start bore tunnel
-        shell: pwsh
         run: |
-          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
-          Expand-Archive bore.zip -DestinationPath ./bore
-          $exe = Join-Path $PWD 'bore/bore.exe'
-          
-          Start-Process -FilePath $exe -ArgumentList 'local','3389','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD/bore_out.log" -RedirectStandardError "$PWD/bore_err.log" -NoNewWindow
-          Start-Sleep -Seconds 10
+          curl -L https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+          chmod +x bore
+          ./bore local 9000 --to bore.pub --port 0 > bore_out.log 2>&1 &
+          sleep 20
 
       - name: Get tunnel and notify
-        shell: pwsh
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           USERNAME: ${{ steps.creds.outputs.USER }}
           PASSWORD: ${{ steps.creds.outputs.PASS }}
         run: |
-          $tunnel = $null
-          for ($i = 1; $i -le 12; $i++) {
-            if (Test-Path "$PWD/bore_out.log") {
-              $log = Get-Content "$PWD/bore_out.log" -Raw
-              if ($log -match 'listening at bore\.pub:(\d+)') {
-                $port = $matches[1]
-                $tunnel = "bore.pub:$port"
-                break
-              }
-            }
-            Start-Sleep -Seconds 5
-          }
+          tunnel=$(grep -o 'bore.pub:[0-9]*' bore_out.log | head -1)
           
-          if (-not $tunnel) {
-            Write-Host "Tunnel not ready"
-            if (Test-Path "$PWD/bore_out.log") { Get-Content "$PWD/bore_out.log" }
+          if [ -z "$tunnel" ]; then
+            echo "Tunnel not ready"
+            cat bore_out.log
             exit 1
-          }
+          fi
           
-          $message = "📱 LO Android + Virtual Camera Ready`n`nAddress: $tunnel`nUsername: $env:USERNAME`nPassword: $env:PASSWORD`n`nFeatures:`n✅ Android (BlueStacks)`n✅ All Play Store apps`n✅ Virtual Camera (OBS)`n✅ Stream video/image as camera`n`nAfter RDP connect:`n1. Run: C:\VirtualCam\start.ps1`n2. Read: C:\VirtualCam\INSTRUCTIONS.txt"
+          message="📱 LO Private Android Phone Ready`nAddress: http://$tunnel`nUsername: $USERNAME`nPassword: $PASSWORD`nAndroid: 11.0 (Redroid)`nVirtual Camera: Active`nControl: Browser-based (scrcpy)"
           
-          $body = @{ content = $message } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
-          Write-Host "Credentials sent privately"
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"$message\"}"
+          
+          echo "Android phone details sent"
 
       - name: Keep alive
         run: |
-          for ($i = 0; $i -lt 340; $i++) {
-            Start-Sleep -Seconds 60
-            if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) { Write-Host "bore died"; break }
-          }
+          sleep 20400
