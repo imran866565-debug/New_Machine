@@ -1,4 +1,4 @@
-name: LO HD Video Player
+name: LO Browser + HD Player
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 permissions: {}
 
 jobs:
-  player:
+  browser:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -21,31 +21,123 @@ jobs:
           echo "USER=$username" >> $GITHUB_OUTPUT
           echo "PASS=$password" >> $GITHUB_OUTPUT
 
-      - name: Install Flask
-        run: pip install flask
+      - name: Install dependencies
+        run: pip install flask requests
 
-      - name: Write HD player app
+      - name: Write browser app
         run: |
-          cat > player_app.py << 'EOFPY'
-          from flask import Flask, request, Response, render_template_string
+          cat > browser_app.py << 'EOFPY'
+          from flask import Flask, request, Response
           from functools import wraps
-          import os
+          import os, re, requests, html as htmlesc
+          from urllib.parse import quote, unquote, urljoin
 
           app = Flask(__name__)
           USERNAME = os.environ.get('AUTH_USER', 'lo')
           PASSWORD = os.environ.get('AUTH_PASS', 'lo')
+          UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36', 'Accept-Language': 'en-US,en;q=0.9'}
 
           def requires_auth(f):
               @wraps(f)
               def decorated(*args, **kwargs):
                   auth = request.authorization
                   if not auth or not (auth.username == USERNAME and auth.password == PASSWORD):
-                      return Response('Login required', 401, {'WWW-Authenticate': 'Basic realm="LO Player"'})
+                      return Response('Login required', 401, {'WWW-Authenticate': 'Basic realm="LO Browser"'})
                   return f(*args, **kwargs)
               return decorated
 
-          PAGE = '''
-          <!DOCTYPE html>
+          def yt_id(u):
+              m = re.search(r'(?:youtu\.be/|v=|embed/|shorts/|live/)([\w-]{11})', u)
+              return m.group(1) if m else None
+
+          def is_media(u):
+              return bool(re.search(r'\.(mp4|webm|ogg|mkv|m3u8|mp3|m4a)(\?|$)', u, re.I))
+
+          def fetch(url):
+              return requests.get(url, headers=UA, timeout=25)
+
+          def target_for(u):
+              if u.startswith('//'): u = 'https:' + u
+              if yt_id(u) or is_media(u):
+                  return '/play?url=' + quote(u, safe='')
+              return '/proxy?url=' + quote(u, safe='')
+
+          CHROME = '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LO Browser</title>
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box}
+          body{font-family:'Segoe UI',system-ui,sans-serif;background:#202124;color:#fff;height:100vh;display:flex;flex-direction:column}
+          .bar{display:flex;gap:8px;padding:10px;background:#171717;align-items:center}
+          .bar button{background:#303134;border:none;color:#fff;width:40px;height:40px;border-radius:50%;font-size:16px;cursor:pointer}
+          .bar input{flex:1;background:#303134;border:1px solid #3c4043;color:#eee;padding:10px 16px;border-radius:20px;font-size:14px;outline:none}
+          .bar .go{width:auto;padding:0 18px;border-radius:20px;background:linear-gradient(90deg,#ff6ec4,#7873f5);font-weight:700}
+          iframe{flex:1;border:none;background:#fff}
+          </style></head><body>
+          <div class="bar">
+          <button onclick="goBack()">&#8592;</button>
+          <button onclick="nav('/home')">&#8962;</button>
+          <input id="addr" placeholder="Search Google or type a URL" onkeydown="if(event.key==='Enter')navigate(this.value)">
+          <button class="go" onclick="navigate(document.getElementById('addr').value)">Go</button>
+          </div>
+          <iframe id="view" src="/home" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>
+          <script>
+          var view=document.getElementById('view'),addr=document.getElementById('addr');
+          var stack=[],idx=-1,suppress=false;
+          function nav(src){stack=stack.slice(0,idx+1);stack.push(src);idx++;suppress=true;view.src=src;}
+          function goBack(){if(idx>0){idx--;suppress=true;view.src=stack[idx];}}
+          view.addEventListener('load',function(){
+            try{
+              var u=view.contentWindow.location.pathname+view.contentWindow.location.search;
+              addr.value=pretty(u);
+              if(!suppress){stack=stack.slice(0,idx+1);stack.push(u);idx++;}
+              suppress=false;
+            }catch(e){suppress=false;}
+          });
+          function pretty(u){
+            var i=u.indexOf('=');
+            if(u.indexOf('/proxy?url=')===0)return decodeURIComponent(u.substring(i+1));
+            if(u.indexOf('/play?url=')===0)return '▶ '+decodeURIComponent(u.substring(i+1));
+            if(u.indexOf('/search?q=')===0)return 'Google: '+decodeURIComponent(u.substring(i+1));
+            return u;
+          }
+          function navigate(v){
+            v=(v||'').trim(); if(!v)return;
+            var isUrl=/^(https?:\\/\\/)?[a-z0-9-]+(\\.[a-z0-9-]+)+([\\/?#].*)?$/i.test(v)&&v.indexOf(' ')===-1;
+            if(isUrl){var u=v.indexOf('http')===0?v:'https://'+v;nav(target(u));}
+            else nav('/search?q='+encodeURIComponent(v));
+          }
+          function target(u){
+            if(/(?:youtu\\.be\\/|v=|embed\\/|shorts\\/|live\\/)([\\w-]{11})/.test(u)||/\\.(mp4|webm|ogg|mkv|m3u8)(\\?|$)/i.test(u))return '/play?url='+encodeURIComponent(u);
+            return '/proxy?url='+encodeURIComponent(u);
+          }
+          </script></body></html>'''
+
+          HOME = '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+          body{font-family:'Segoe UI',sans-serif;background:#202124;color:#fff;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px}
+          .logo{font-size:3rem;font-weight:800;background:linear-gradient(90deg,#4285f4,#ea4335,#fbbc05,#34a853);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+          form{width:90%;max-width:500px;text-align:center}
+          input{width:100%;padding:14px 20px;border-radius:24px;border:1px solid #3c4043;background:#303134;color:#fff;font-size:16px;outline:none}
+          button{margin-top:12px;padding:10px 24px;border:none;border-radius:8px;background:#8ab4f8;color:#202124;font-weight:700}
+          </style></head><body>
+          <div class="logo">LO Browser</div>
+          <form onsubmit="event.preventDefault();parent.navigate(document.getElementById('q').value);">
+          <input id="q" placeholder="Search Google or type a URL" autofocus>
+          <br><button type="submit">Google Search</button>
+          </form>
+          </body></html>'''
+
+          SEARCH_TPL = '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+          body{font-family:Arial,sans-serif;background:#202124;color:#eee;padding:20px;max-width:700px;margin:0 auto}
+          h2{color:#8ab4f8;font-size:16px;margin-bottom:10px}
+          .res{margin:20px 0}
+          .res a{color:#8ab4f8;font-size:18px;text-decoration:none}
+          .res a:hover{text-decoration:underline}
+          .res .u{color:#34a853;font-size:12px;margin-top:2px;word-break:break-all}
+          </style></head><body>
+          <h2>Google results for: __Q__</h2>
+          __ITEMS__
+          </body></html>'''
+
+          PLAY = '''<!DOCTYPE html>
           <html lang="en">
           <head>
           <meta charset="UTF-8">
@@ -103,7 +195,7 @@ jobs:
           const vid=document.getElementById('vid'), yt=document.getElementById('yt'), ph=document.getElementById('ph'), stage=document.getElementById('stage');
           let hls=null, mode='none';
           function fmt(s){s=Math.floor(s||0);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');}
-          function ytId(u){const m=u.match(/(?:youtu\\.be\\/|v=|embed\\/|shorts\\/)([\\w-]{11})/);return m?m[1]:null;}
+          function ytId(u){const m=u.match(/(?:youtu\\.be\\/|v=|embed\\/|shorts\\/|live\\/)([\\w-]{11})/);return m?m[1]:null;}
           function loadMedia(){
             const u=document.getElementById('url').value.trim(); if(!u)return;
             ph.style.display='none';
@@ -111,7 +203,7 @@ jobs:
             const id=ytId(u);
             if(id){ mode='yt'; vid.style.display='none'; yt.style.display='block'; yt.src='https://www.youtube.com/embed/'+id+'?autoplay=1'; applyBright(); return; }
             yt.style.display='none'; yt.src=''; vid.style.display='block'; mode='video';
-            if(u.includes('.m3u8') && Hls.isSupported()){ hls=new Hls(); hls.loadSource(u); hls.attachMedia(vid); }
+            if(u.indexOf('.m3u8')>-1 && window.Hls && Hls.isSupported()){ hls=new Hls(); hls.loadSource(u); hls.attachMedia(vid); }
             else { vid.src=u; }
             vid.play().catch(function(){});
           }
@@ -125,27 +217,115 @@ jobs:
           function applyBright(){ const v=document.getElementById('bright').value; vid.style.filter='brightness('+v+'%)'; yt.style.filter='brightness('+v+'%)'; }
           document.getElementById('bright').addEventListener('input',applyBright);
           function goFull(){ if(stage.requestFullscreen){stage.requestFullscreen();} else if(vid.webkitEnterFullscreen){vid.webkitEnterFullscreen();} }
+          var pu=new URLSearchParams(location.search).get('url');
+          if(pu){document.getElementById('url').value=pu; loadMedia();}
           </script>
           </body>
-          </html>
-          '''
+          </html>'''
+
+          def google_search(q):
+              results = []
+              try:
+                  r = fetch('https://www.google.com/search?q=' + quote(q) + '&hl=en&num=10')
+                  for m in re.finditer(r'<a[^>]+href="/url\?q=([^&"]+)[^"]*"[^>]*>((?:(?!</a>).)*?)</a>', r.text, re.S):
+                      url = unquote(m.group(1))
+                      t = re.search(r'<h3[^>]*>(.*?)</h3>', m.group(2), re.S)
+                      if t and url.startswith('http'):
+                          results.append((re.sub(r'<[^>]+>', '', t.group(1)), url))
+                      if len(results) >= 10:
+                          break
+              except Exception:
+                  pass
+              if not results:
+                  try:
+                      r = fetch('https://html.duckduckgo.com/html/?q=' + quote(q))
+                      for m in re.finditer(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>((?:(?!</a>).)*?)</a>', r.text, re.S):
+                          results.append((re.sub(r'<[^>]+>', '', m.group(2)), m.group(1)))
+                          if len(results) >= 10:
+                              break
+                  except Exception:
+                      pass
+              return results
 
           @app.route('/')
           @requires_auth
           def index():
-              return render_template_string(PAGE)
+              return Response(CHROME, mimetype='text/html')
+
+          @app.route('/home')
+          @requires_auth
+          def home():
+              return Response(HOME, mimetype='text/html')
+
+          @app.route('/search')
+          @requires_auth
+          def search():
+              q = request.args.get('q', '')
+              items = ''
+              for title, url in google_search(q):
+                  items += '<div class="res"><a href="' + target_for(url) + '">' + htmlesc.escape(title) + '</a><div class="u">' + htmlesc.escape(url) + '</div></div>'
+              if not items:
+                  items = '<div class="res">No results found. Try again.</div>'
+              page = SEARCH_TPL.replace('__Q__', htmlesc.escape(q)).replace('__ITEMS__', items)
+              return Response(page, mimetype='text/html')
+
+          @app.route('/play')
+          @requires_auth
+          def play():
+              return Response(PLAY, mimetype='text/html')
+
+          @app.route('/proxy')
+          @requires_auth
+          def proxy():
+              url = request.args.get('url', '')
+              if not url.startswith('http'):
+                  return Response('Bad URL', 400)
+              if yt_id(url) or is_media(url):
+                  return Response('<script>location.replace("/play?url=' + quote(url, safe='') + '")</script>', mimetype='text/html')
+              try:
+                  r = fetch(url)
+              except Exception:
+                  return Response('Could not load page', 502)
+              ct = r.headers.get('Content-Type', '')
+              if 'text/html' not in ct:
+                  if ct.startswith('video') or ct.startswith('audio'):
+                      return Response('<script>location.replace("/play?url=' + quote(url, safe='') + '")</script>', mimetype='text/html')
+                  return Response(r.content, mimetype=ct or 'application/octet-stream')
+              h = r.text
+              h = re.sub(r'<script[\s\S]*?</script>', '', h, flags=re.I)
+              h = re.sub(r'<iframe[\s\S]*?</iframe>', '', h, flags=re.I)
+              h = re.sub(r'<base[^>]*>', '', h, flags=re.I)
+              h = re.sub(r'\ssrcset\s*=\s*"[^"]*"', '', h, flags=re.I)
+              h = re.sub(r'\son\w+\s*=\s*"[^"]*"', '', h, flags=re.I)
+              h = re.sub(r'(<head[^>]*>)', r'\1<meta name="referrer" content="no-referrer">', h, count=1, flags=re.I)
+
+              def href_fix(m):
+                  raw = m.group(2).strip()
+                  if not raw or raw.startswith('#') or raw.startswith('javascript:'):
+                      return m.group(0)
+                  absu = urljoin(url, raw)
+                  return m.group(1) + target_for(absu) + '"'
+              h = re.sub(r'(<a\b[^>]*\shref\s*=\s*")([^"]*)', href_fix, h, flags=re.I)
+
+              def src_fix(m):
+                  raw = m.group(2).strip()
+                  if not raw:
+                      return m.group(0)
+                  return m.group(1) + urljoin(url, raw) + '"'
+              h = re.sub(r'(<(?:img|video|audio|source|link|track)\b[^>]*?\s(?:src|href|poster)\s*=\s*")([^"]*)', src_fix, h, flags=re.I)
+              return Response(h, mimetype='text/html')
 
           if __name__ == '__main__':
               app.run(host='0.0.0.0', port=5000, threaded=True)
           EOFPY
 
-      - name: Launch player, tunnel, notify, keep alive
+      - name: Launch browser, tunnel, notify, keep alive
         env:
           AUTH_USER: ${{ steps.creds.outputs.USER }}
           AUTH_PASS: ${{ steps.creds.outputs.PASS }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          nohup python3 player_app.py > app.log 2>&1 &
+          nohup python3 browser_app.py > app.log 2>&1 &
           APP_PID=$!
           sleep 4
 
@@ -162,11 +342,11 @@ jobs:
             exit 1
           fi
 
-          payload=$(jq -n --arg c "🎬 LO HD Player Ready
+          payload=$(jq -n --arg c "🌐 LO Browser Ready
           Address: http://$tunnel
           Username: $AUTH_USER
           Password: $AUTH_PASS
-          (YouTube / MP4 / M3U8 sab chalta hai)" '{content:$c}')
+          (Search Google, browse, videos auto-HD player)" '{content:$c}')
           curl -s -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$payload" > /dev/null
           echo "Details sent privately."
 
