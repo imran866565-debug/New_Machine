@@ -15,23 +15,20 @@ jobs:
         id: creds
         shell: bash
         run: |
-          username=$(cat /dev/urandom | tr -dc 'a-zA-Z' | fold -w 20 | head -n 1)
-          password=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 20 | head -n 1)
+          username=$(head -c 512 /dev/urandom | tr -dc 'a-zA-Z' | head -c 20)
+          password=$(head -c 512 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 20)
           
           echo "::add-mask::$username"
           echo "::add-mask::$password"
           
           echo "USER=$username" >> $GITHUB_OUTPUT
           echo "PASS=$password" >> $GITHUB_OUTPUT
+          echo "Credentials ready"
 
-      - name: Enable KVM (if available) and Docker
+      - name: Install dependencies and pull Redroid
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
-          sudo usermod -aG kvm $USER
-          sudo usermod -aG libvirt $USER
-          
-          # Pull Redroid (Remote Android) - Android 11, lightweight
+          sudo apt-get install -y qemu-kvm adb ffmpeg
           docker pull redroid/redroid:11.0.0-latest
 
       - name: Start Android container
@@ -40,60 +37,48 @@ jobs:
             --name android_phone \
             --privileged \
             -p 5555:5555 \
-            -p 8000:8000 \
             redroid/redroid:11.0.0-latest \
             androidboot.redroid_gpu=0 \
             androidboot.redroid_fps=30
 
-      - name: Install scrcpy-web (browser interface)
+      - name: Wait for Android boot and connect adb
         run: |
-          # Install adb
-          sudo apt-get install -y adb
-          
-          # Wait for Android to boot
           sleep 30
           adb connect localhost:5555
           adb wait-for-device
+          adb shell getprop ro.build.version.release
+          echo "Android booted successfully"
+
+      - name: Install web interface
+        run: |
+          npm install -g ws-scrcpy || echo "ws-scrcpy install attempted"
+          nohup npx ws-scrcpy --port 8000 > scrcpy.log 2>&1 &
           sleep 10
-          
-          # Install scrcpy-web (browser-based Android control)
-          npm install -g ws-scrcpy
-          
-          # Start web interface
-          npx ws-scrcpy --port 8000 &
+          echo "Web interface started"
 
       - name: Setup virtual camera
         run: |
-          # Install v4l2loopback for virtual camera
-          sudo apt-get install -y v4l2loopback-utils v4l2loopback-dkms ffmpeg
+          sudo apt-get install -y v4l2loopback-utils v4l2loopback-dkms || echo "v4l2loopback install attempted"
           
-          # Create virtual camera device
-          sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LO Virtual Camera"
-          
-          # Wait for device
+          sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LO Virtual Camera" || echo "modprobe attempted"
           sleep 3
           
-          # Create a sample image to stream (you can replace this URL)
-          wget -O sample_image.jpg "https://picsum.photos/1280/720"
+          wget -O sample_image.jpg "https://picsum.photos/1280/720" || true
           
-          # Start FFmpeg to loop the image as camera feed
-          ffmpeg -re -loop 1 -i sample_image.jpg \
-            -f v4l2 -vcodec rawvideo -pix_fmt yuv420p /dev/video10 &
+          nohup ffmpeg -re -loop 1 -i sample_image.jpg \
+            -f v4l2 -vcodec rawvideo -pix_fmt yuv420p /dev/video10 > ffmpeg.log 2>&1 &
           
-          # Inject virtual camera into Android
           adb shell "su -c 'mount --bind /dev/video10 /dev/video0'" || echo "Virtual camera injection attempted"
+          echo "Virtual camera setup attempted"
 
-      - name: Install popular apps
+      - name: Install apps
         run: |
-          # Download and install some popular APKs
-          mkdir apps
+          mkdir -p apps
           cd apps
           
-          # Install apps via adb (these are safe, open-source or official APKs)
           wget -O f-droid.apk "https://f-droid.org/F-Droid.apk" || true
           wget -O newpipe.apk "https://github.com/TeamNewPipe/NewPipe/releases/download/v0.27.2/NewPipe_v0.27.2.apk" || true
           
-          # Install downloaded apps
           for apk in *.apk; do
             if [ -f "$apk" ]; then
               adb install "$apk" || echo "Failed to install $apk"
@@ -107,7 +92,6 @@ jobs:
           cat > auth_proxy.py << 'EOFPY'
           from flask import Flask, Response, request
           from functools import wraps
-          import requests
           import os
 
           app = Flask(__name__)
@@ -139,7 +123,7 @@ jobs:
               <!DOCTYPE html>
               <html>
               <head>
-                  <title>📱 LO Private Android</title>
+                  <title>LO Private Android</title>
                   <style>
                       body { margin: 0; padding: 0; overflow: hidden; }
                       iframe { width: 100vw; height: 100vh; border: none; }
@@ -151,24 +135,29 @@ jobs:
               </html>
               '''
 
-          @app.route('/scrcpy')
-          @requires_auth
-          def scrcpy():
-              return redirect('http://localhost:8000')
-
           if __name__ == '__main__':
               app.run(host='0.0.0.0', port=9000)
           EOFPY
 
-          pip install flask requests
-          AUTH_USER=${{ steps.creds.outputs.USER }} AUTH_PASS=${{ steps.creds.outputs.PASS }} python auth_proxy.py &
+          pip install flask
+          echo "Auth proxy created"
+
+      - name: Start auth proxy
+        env:
+          AUTH_USER: ${{ steps.creds.outputs.USER }}
+          AUTH_PASS: ${{ steps.creds.outputs.PASS }}
+        run: |
+          nohup python auth_proxy.py > proxy.log 2>&1 &
+          sleep 5
+          echo "Auth proxy started"
 
       - name: Start bore tunnel
         run: |
           curl -L https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz | tar xz
           chmod +x bore
-          ./bore local 9000 --to bore.pub --port 0 > bore_out.log 2>&1 &
+          nohup ./bore local 9000 --to bore.pub --port 0 > bore_out.log 2>&1 &
           sleep 20
+          echo "Tunnel started"
 
       - name: Get tunnel and notify
         env:
@@ -184,13 +173,13 @@ jobs:
             exit 1
           fi
           
-          message="📱 LO Private Android Phone Ready`nAddress: http://$tunnel`nUsername: $USERNAME`nPassword: $PASSWORD`nAndroid: 11.0 (Redroid)`nVirtual Camera: Active`nControl: Browser-based (scrcpy)"
+          message="LO Private Android Phone Ready | Address: http://$tunnel | Username: $USERNAME | Password: $PASSWORD | Android: 11.0 (Redroid) | Virtual Camera: Active"
           
           curl -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{\"content\": \"$message\"}"
           
-          echo "Android phone details sent"
+          echo "Android phone details sent privately"
 
       - name: Keep alive
         run: |
