@@ -1,4 +1,4 @@
-name: LO Ultra Secure RDP (No Card Needed)
+name: LO Ultra Secure RDP (Random Everything)
 
 on:
   workflow_dispatch:
@@ -11,16 +11,24 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Create temporary admin user
-        id: pass
+      - name: Create temporary random admin user
+        id: creds
         shell: pwsh
         run: |
+          $username = -join ((97..122) + (65..90) | Get-Random -Count 20 | ForEach-Object {[char]$_})
           $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          
+          Write-Output "::add-mask::$username"
           Write-Output "::add-mask::$password"
+          
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "USER=$username"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "PASS=$password"
+          
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name lo_admin -Password $secure
-          Add-LocalGroupMember -Group Administrators -Member lo_admin
+          New-LocalUser -Name $username -Password $secure
+          Add-LocalGroupMember -Group Administrators -Member $username
+          
+          Write-Host "Random admin user created successfully"
 
       - name: Enable RDP with NLA
         shell: pwsh
@@ -33,18 +41,17 @@ jobs:
         shell: pwsh
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          PASS: ${{ steps.pass.outputs.PASS }}
+          USERNAME: ${{ steps.creds.outputs.USER }}
+          PASSWORD: ${{ steps.creds.outputs.PASS }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:WEBHOOK_URL)) { Write-Host "Missing webhook"; exit 1 }
 
           Add-MpPreference -ExclusionPath "$PWD\bore" -ErrorAction SilentlyContinue
 
-          # Download bore (a free TCP tunnel tool, no card needed)
           Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
           Expand-Archive bore.zip -DestinationPath ./bore
           $exe = Join-Path $PWD 'bore/bore.exe'
 
-          # Start bore in background
           Start-Process -FilePath $exe -ArgumentList 'local','3389','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD/bore_out.log" -RedirectStandardError "$PWD/bore_err.log" -NoNewWindow
           Start-Sleep -Seconds 10
 
@@ -76,12 +83,11 @@ jobs:
             exit 1
           }
 
-          $message = "LO Private RDP Ready`nAddress: $tunnel`nUser: lo_admin`nPassword: $env:PASS"
+          $message = "LO Private RDP Ready 🔥`nAddress: $tunnel`nUsername: $env:USERNAME`nPassword: $env:PASSWORD"
           $body = @{ content = $message } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
-          Write-Host "Details sent privately."
+          Write-Host "Random credentials sent privately."
 
-          # Keep alive for 6 hours
           for ($i = 0; $i -lt 340; $i++) {
             Start-Sleep -Seconds 60
             if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) { Write-Host "bore died, ending."; break }
