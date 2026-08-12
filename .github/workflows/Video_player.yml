@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies and pull Redroid
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-kvm adb ffmpeg
+          sudo apt-get install -y qemu-kvm adb ffmpeg nginx || true
           docker pull redroid/redroid:11.0.0-latest
 
       - name: Start Android container
@@ -36,6 +36,7 @@ jobs:
           docker run -itd \
             --name android_phone \
             --privileged \
+            --shm-size=1g \
             -p 5555:5555 \
             redroid/redroid:11.0.0-latest \
             androidboot.redroid_gpu=0 \
@@ -43,32 +44,50 @@ jobs:
 
       - name: Wait for Android boot and connect adb
         run: |
-          sleep 30
-          adb connect localhost:5555
-          adb wait-for-device
-          adb shell getprop ro.build.version.release
+          adb kill-server || true
+          sleep 10
+          
+          echo "--- container status ---"
+          docker ps -a --filter name=android_phone
+          
+          connected=""
+          for i in $(seq 1 30); do
+            if adb connect localhost:5555 2>&1 | grep -q "connected to"; then
+              connected="yes"
+              break
+            fi
+            echo "Waiting for Android to boot... attempt $i"
+            sleep 5
+          done
+          
+          if [ -z "$connected" ]; then
+            echo "Android did not boot. Container logs:"
+            docker logs android_phone 2>&1 | tail -60
+            exit 1
+          fi
+          
+          adb -s localhost:5555 wait-for-device
+          adb -s localhost:5555 shell getprop ro.build.version.release
           echo "Android booted successfully"
 
       - name: Install web interface
         run: |
           npm install -g ws-scrcpy || echo "ws-scrcpy install attempted"
-          nohup npx ws-scrcpy --port 8000 > scrcpy.log 2>&1 &
+          nohup ws-scrcpy --port 8000 > scrcpy.log 2>&1 &
           sleep 10
           echo "Web interface started"
 
-      - name: Setup virtual camera
+      - name: Setup virtual camera (best effort)
         run: |
           sudo apt-get install -y v4l2loopback-utils v4l2loopback-dkms || echo "v4l2loopback install attempted"
-          
           sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LO Virtual Camera" || echo "modprobe attempted"
           sleep 3
           
           wget -O sample_image.jpg "https://picsum.photos/1280/720" || true
-          
           nohup ffmpeg -re -loop 1 -i sample_image.jpg \
             -f v4l2 -vcodec rawvideo -pix_fmt yuv420p /dev/video10 > ffmpeg.log 2>&1 &
           
-          adb shell "su -c 'mount --bind /dev/video10 /dev/video0'" || echo "Virtual camera injection attempted"
+          adb -s localhost:5555 shell "su -c 'mount --bind /dev/video10 /dev/video0'" || echo "Virtual camera injection attempted"
           echo "Virtual camera setup attempted"
 
       - name: Install apps
@@ -81,75 +100,42 @@ jobs:
           
           for apk in *.apk; do
             if [ -f "$apk" ]; then
-              adb install "$apk" || echo "Failed to install $apk"
+              adb -s localhost:5555 install "$apk" || echo "Failed to install $apk"
             fi
           done
           
           echo "Apps installation attempted"
 
-      - name: Create authentication proxy
-        run: |
-          cat > auth_proxy.py << 'EOFPY'
-          from flask import Flask, Response, request
-          from functools import wraps
-          import os
-
-          app = Flask(__name__)
-
-          USERNAME = os.environ.get('AUTH_USER')
-          PASSWORD = os.environ.get('AUTH_PASS')
-
-          def check_auth(username, password):
-              return username == USERNAME and password == PASSWORD
-
-          def authenticate():
-              return Response('Authentication required', 401, {
-                  'WWW-Authenticate': 'Basic realm="Login Required"'
-              })
-
-          def requires_auth(f):
-              @wraps(f)
-              def decorated(*args, **kwargs):
-                  auth = request.authorization
-                  if not auth or not check_auth(auth.username, auth.password):
-                      return authenticate()
-                  return f(*args, **kwargs)
-              return decorated
-
-          @app.route('/')
-          @requires_auth
-          def index():
-              return '''
-              <!DOCTYPE html>
-              <html>
-              <head>
-                  <title>LO Private Android</title>
-                  <style>
-                      body { margin: 0; padding: 0; overflow: hidden; }
-                      iframe { width: 100vw; height: 100vh; border: none; }
-                  </style>
-              </head>
-              <body>
-                  <iframe src="/scrcpy"></iframe>
-              </body>
-              </html>
-              '''
-
-          if __name__ == '__main__':
-              app.run(host='0.0.0.0', port=9000)
-          EOFPY
-
-          pip install flask
-          echo "Auth proxy created"
-
-      - name: Start auth proxy
+      - name: Setup nginx auth gate
         env:
           AUTH_USER: ${{ steps.creds.outputs.USER }}
           AUTH_PASS: ${{ steps.creds.outputs.PASS }}
         run: |
-          nohup python auth_proxy.py > proxy.log 2>&1 &
-          sleep 5
-          echo "Auth proxy started"
+          HASH=$(openssl passwd -apr1 "$AUTH_PASS")
+          echo "$AUTH_USER:$HASH" | sudo tee /etc/nginx/.htpasswd
+          
+          sudo tee /etc/nginx/sites-available/android << 'EOFNG'
+          server {
+            listen 9000;
+            location / {
+              auth_basic "LO Private Android";
+              auth_basic_user_file /etc/nginx/.htpasswd;
+              proxy_pass http://127.0.0.1:8000;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_read_timeout 3600s;
+              proxy_send_timeout 3600s;
+            }
+          }
+          EOFNG
+          
+          sudo ln -sf /etc/nginx/sites-available/android /etc/nginx/sites-enabled/android
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
+          sudo systemctl restart nginx || sudo service nginx restart || sudo nginx
+          echo "Auth gate ready"
 
       - name: Start bore tunnel
         run: |
@@ -173,7 +159,7 @@ jobs:
             exit 1
           fi
           
-          message="LO Private Android Phone Ready | Address: http://$tunnel | Username: $USERNAME | Password: $PASSWORD | Android: 11.0 (Redroid) | Virtual Camera: Active"
+          message="LO Private Android Phone Ready | Address: http://$tunnel | Username: $USERNAME | Password: $PASSWORD | Android: 11.0 (Redroid) | Control: Browser (scrcpy)"
           
           curl -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
