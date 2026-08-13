@@ -25,16 +25,15 @@ jobs:
           echo "PASS=$password" >> $GITHUB_OUTPUT
           echo "Credentials ready"
 
-      - name: Install dependencies and pull Redroid
+      - name: Install dependencies and pull Redroid 13
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-kvm adb ffmpeg nginx || true
-          docker pull redroid/redroid:11.0.0-latest
+          docker pull redroid/redroid:13.0.0-latest
 
       - name: Load Android kernel modules
         run: |
           sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || echo "binder modprobe failed"
-          sudo modprobe ashmem_linux || echo "ashmem modprobe skipped"
           lsmod | grep -i binder || echo "no binder module found"
 
       - name: Start Android container
@@ -44,7 +43,7 @@ jobs:
             --privileged \
             --shm-size=1g \
             -p 5555:5555 \
-            redroid/redroid:11.0.0-latest \
+            redroid/redroid:13.0.0-latest \
             androidboot.redroid_gpu=0 \
             androidboot.redroid_fps=30
 
@@ -70,18 +69,21 @@ jobs:
           fi
           
           booted=""
-          for i in $(seq 1 60); do
+          for i in $(seq 1 70); do
             state=$(timeout 10 adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
             if [ "$state" = "1" ]; then
               booted="yes"
               break
             fi
             echo "Android booting... attempt $i"
-            sleep 5
+            sleep 6
           done
           
           if [ -z "$booted" ]; then
-            echo "Android did not finish booting. Logs:"
+            echo "Android did not finish booting."
+            echo "--- logcat ---"
+            timeout 15 adb -s localhost:5555 logcat -d -t 100 2>/dev/null || true
+            echo "--- container logs ---"
             docker logs android_phone 2>&1 | tail -60
             exit 1
           fi
@@ -178,7 +180,7 @@ jobs:
             exit 1
           fi
           
-          message="LO Private Android Phone Ready | Address: http://$tunnel | Username: $USERNAME | Password: $PASSWORD | Android: 11.0 (Redroid) | Control: Browser (scrcpy)"
+          message="LO Private Android Phone Ready | Address: http://$tunnel | Username: $USERNAME | Password: $PASSWORD | Android: 13 (Redroid) | Control: Browser (scrcpy)"
           
           curl -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
