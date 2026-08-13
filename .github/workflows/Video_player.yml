@@ -31,6 +31,12 @@ jobs:
           sudo apt-get install -y qemu-kvm adb ffmpeg nginx || true
           docker pull redroid/redroid:11.0.0-latest
 
+      - name: Load Android kernel modules
+        run: |
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || echo "binder modprobe failed"
+          sudo modprobe ashmem_linux || echo "ashmem modprobe skipped"
+          lsmod | grep -i binder || echo "no binder module found"
+
       - name: Start Android container
         run: |
           docker run -itd \
@@ -45,28 +51,41 @@ jobs:
       - name: Wait for Android boot and connect adb
         run: |
           adb kill-server || true
-          sleep 10
-          
-          echo "--- container status ---"
-          docker ps -a --filter name=android_phone
+          adb start-server || true
           
           connected=""
-          for i in $(seq 1 30); do
-            if adb connect localhost:5555 2>&1 | grep -q "connected to"; then
+          for i in $(seq 1 40); do
+            if timeout 10 adb connect localhost:5555 2>&1 | grep -q "connected to"; then
               connected="yes"
               break
             fi
-            echo "Waiting for Android to boot... attempt $i"
+            echo "Waiting for adb... attempt $i"
             sleep 5
           done
           
           if [ -z "$connected" ]; then
-            echo "Android did not boot. Container logs:"
+            echo "Could not connect. Container logs:"
             docker logs android_phone 2>&1 | tail -60
             exit 1
           fi
           
-          adb -s localhost:5555 wait-for-device
+          booted=""
+          for i in $(seq 1 60); do
+            state=$(timeout 10 adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$state" = "1" ]; then
+              booted="yes"
+              break
+            fi
+            echo "Android booting... attempt $i"
+            sleep 5
+          done
+          
+          if [ -z "$booted" ]; then
+            echo "Android did not finish booting. Logs:"
+            docker logs android_phone 2>&1 | tail -60
+            exit 1
+          fi
+          
           adb -s localhost:5555 shell getprop ro.build.version.release
           echo "Android booted successfully"
 
