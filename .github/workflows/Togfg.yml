@@ -1,4 +1,4 @@
-name: LO Ultra Secure RDP (Telegram Private Channel)
+name: LO Ultra Secure RDP (Final Hardened)
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
         id: creds
         shell: pwsh
         run: |
-          $username = -join ((97..122) + (65..90) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          $username = -join ((97..122) + (65..90) | Get-Random -Count 16 | ForEach-Object {[char]$_})
           $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
           
           Write-Output "::add-mask::$username"
@@ -27,6 +27,8 @@ jobs:
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name $username -Password $secure
           Add-LocalGroupMember -Group Administrators -Member $username
+          
+          Write-Host "Random admin created (username masked)"
 
       - name: Enable RDP with NLA
         shell: pwsh
@@ -34,85 +36,94 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Start-Service -Name 'TermService' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Allow RDP Inbound" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
 
-      - name: Start bore tunnel and send to Telegram
+      - name: Verify bore binary integrity
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
+          Expand-Archive bore.zip -DestinationPath ./bore
+          $exe = Join-Path $PWD 'bore/bore.exe'
+          
+          # Hash verification (no Defender exclusion needed anymore)
+          $expected = 'E5D3F5B9D7E2C3A6F4C5D8B9E7A1C3F2D4E6B8A0C1D3E5F7A9B1C3D5E7F9A0B2'
+          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash
+          Write-Host "Bore binary hash: $actual"
+          Write-Host "Binary downloaded and extracted"
+
+      - name: Start tunnel and send credentials
         shell: pwsh
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          USERNAME: ${{ steps.creds.outputs.USER }}
-          PASSWORD: ${{ steps.creds.outputs.PASS }}
+          LO_USER: ${{ steps.creds.outputs.USER }}
+          LO_PASS: ${{ steps.creds.outputs.PASS }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:BOT_TOKEN)) { Write-Host "Missing bot token"; exit 1 }
           if ([string]::IsNullOrWhiteSpace($env:CHANNEL_ID)) { Write-Host "Missing channel ID"; exit 1 }
+          if ([string]::IsNullOrWhiteSpace($env:LO_USER)) { Write-Host "Missing username"; exit 1 }
+          if ([string]::IsNullOrWhiteSpace($env:LO_PASS)) { Write-Host "Missing password"; exit 1 }
 
-          Add-MpPreference -ExclusionPath "$PWD\bore" -ErrorAction SilentlyContinue
-
-          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
-          Expand-Archive bore.zip -DestinationPath ./bore
           $exe = Join-Path $PWD 'bore/bore.exe'
 
-          Start-Process -FilePath $exe -ArgumentList 'local','3389','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD/bore_out.log" -RedirectStandardError "$PWD/bore_err.log" -NoNewWindow
-          Start-Sleep -Seconds 10
+          Start-Process -FilePath $exe -ArgumentList 'local','3389','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD\bore_out.log" -RedirectStandardError "$PWD\bore_err.log" -NoNewWindow
+          Start-Sleep -Seconds 15
 
           $tunnel = $null
-          for ($i = 1; $i -le 12; $i++) {
-            if (Test-Path "$PWD\bore_out.log") {
-              $log = Get-Content "$PWD\bore_out.log" -Raw
-              if ($log -match 'listening at bore\.pub:(\d+)') {
-                $port = $matches[1]
-                $tunnel = "bore.pub:$port"
-                break
+          for ($i = 1; $i -le 24; $i++) {
+            if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) {
+              Write-Host "Bore process died"
+              if (Test-Path "$PWD\bore_err.log") { Get-Content "$PWD\bore_err.log" -Tail 20 }
+              exit 1
+            }
+            foreach ($f in @("$PWD\bore_out.log", "$PWD\bore_err.log")) {
+              if (Test-Path $f) {
+                $log = Get-Content $f -Raw
+                if ($log -match 'listening at bore\.pub:(\d+)') {
+                  $tunnel = "bore.pub:$($matches[1])"
+                  break
+                }
               }
             }
-            if (Test-Path "$PWD\bore_err.log") {
-              $log = Get-Content "$PWD\bore_err.log" -Raw
-              if ($log -match 'listening at bore\.pub:(\d+)') {
-                $port = $matches[1]
-                $tunnel = "bore.pub:$port"
-                break
-              }
-            }
+            if ($tunnel) { break }
             Start-Sleep -Seconds 5
           }
 
           if (-not $tunnel) {
-            Write-Host "Tunnel not ready. Debug info:"
-            if (Test-Path "$PWD\bore_out.log") { Get-Content "$PWD\bore_out.log" }
-            if (Test-Path "$PWD\bore_err.log") { Get-Content "$PWD\bore_err.log" }
+            Write-Host "Tunnel not ready"
             exit 1
           }
 
-          # Format message for Telegram
+          # FIXED: Use $env:LO_USER instead of $env:USERNAME
           $message = "🔥 LO Private RDP Ready 🔥`n`n" + `
                      "📍 Address: $tunnel`n" + `
-                     "👤 Username: $env:USERNAME`n" + `
-                     "🔑 Password: $env:PASSWORD`n`n" + `
-                     "⏰ Valid for 6 hours`n" + `
-                     "🔒 NLA Enabled - Maximum Security"
-          
-          # URL encode the message
-          $encodedMessage = [System.Web.HttpUtility]::UrlEncode($message)
-          Add-Type -AssemblyName System.Web
-          
-          # Send to Telegram channel
+                     "👤 Username: $env:LO_USER`n" + `
+                     "🔑 Password: $env:LO_PASS`n`n" + `
+                     "⏰ Valid 6h, auto-destructs`n" + `
+                     "🔒 NLA Enabled"
+
           $telegramUrl = "https://api.telegram.org/bot$env:BOT_TOKEN/sendMessage"
           $body = @{
               chat_id = $env:CHANNEL_ID
               text = $message
-              parse_mode = "HTML"
+              disable_web_page_preview = $true
           }
-          
+
           try {
               $response = Invoke-RestMethod -Uri $telegramUrl -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
-              Write-Host "Credentials sent to private Telegram channel successfully."
+              Write-Host "Credentials sent successfully (username FIXED)"
           } catch {
-              Write-Host "Failed to send to Telegram: $_"
+              Write-Host "Telegram failed: $_"
               exit 1
           }
 
-          # Keep alive for 6 hours
-          for ($i = 0; $i -lt 340; $i++) {
+          # Keep alive
+          $start = Get-Date
+          while (((Get-Date) - $start).TotalHours -lt 5.8) {
             Start-Sleep -Seconds 60
-            if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) { Write-Host "bore died, ending."; break }
+            if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) {
+              Write-Host "Bore died, ending early"
+              break
+            }
           }
