@@ -1,4 +1,4 @@
-name: LO Ultra Secure Android Phone
+name: LO OpenClaw Private Access
 
 on:
   workflow_dispatch:
@@ -6,188 +6,134 @@ on:
 permissions: {}
 
 jobs:
-  android:
-    runs-on: ubuntu-latest
+  openclaw:
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Generate random credentials
-        id: creds
-        shell: bash
-        run: |
-          username=$(head -c 512 /dev/urandom | tr -dc 'a-zA-Z' | head -c 20)
-          password=$(head -c 512 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 20)
-          
-          echo "::add-mask::$username"
-          echo "::add-mask::$password"
-          
-          echo "USER=$username" >> $GITHUB_OUTPUT
-          echo "PASS=$password" >> $GITHUB_OUTPUT
-          echo "Credentials ready"
-
-      - name: Install dependencies and pull Redroid 13
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-kvm adb ffmpeg nginx || true
-          docker pull redroid/redroid:13.0.0-latest
-
-      - name: Load Android kernel modules
-        run: |
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || echo "binder modprobe failed"
-          lsmod | grep -i binder || echo "no binder module found"
-
-      - name: Start Android container
-        run: |
-          docker run -itd \
-            --name android_phone \
-            --privileged \
-            --shm-size=1g \
-            -p 5555:5555 \
-            redroid/redroid:13.0.0-latest \
-            androidboot.redroid_gpu=0 \
-            androidboot.redroid_fps=30
-
-      - name: Wait for Android boot and connect adb
-        run: |
-          adb kill-server || true
-          adb start-server || true
-          
-          connected=""
-          for i in $(seq 1 40); do
-            if timeout 10 adb connect localhost:5555 2>&1 | grep -q "connected to"; then
-              connected="yes"
-              break
-            fi
-            echo "Waiting for adb... attempt $i"
-            sleep 5
-          done
-          
-          if [ -z "$connected" ]; then
-            echo "Could not connect. Container logs:"
-            docker logs android_phone 2>&1 | tail -60
-            exit 1
-          fi
-          
-          booted=""
-          for i in $(seq 1 70); do
-            state=$(timeout 10 adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            if [ "$state" = "1" ]; then
-              booted="yes"
-              break
-            fi
-            echo "Android booting... attempt $i"
-            sleep 6
-          done
-          
-          if [ -z "$booted" ]; then
-            echo "Android did not finish booting."
-            echo "--- logcat ---"
-            timeout 15 adb -s localhost:5555 logcat -d -t 100 2>/dev/null || true
-            echo "--- container logs ---"
-            docker logs android_phone 2>&1 | tail -60
-            exit 1
-          fi
-          
-          adb -s localhost:5555 shell getprop ro.build.version.release
-          echo "Android booted successfully"
-
-      - name: Install web interface
-        run: |
-          npm install -g ws-scrcpy || echo "ws-scrcpy install attempted"
-          nohup ws-scrcpy --port 8000 > scrcpy.log 2>&1 &
-          sleep 10
-          echo "Web interface started"
-
-      - name: Setup virtual camera (best effort)
-        run: |
-          sudo apt-get install -y v4l2loopback-utils v4l2loopback-dkms || echo "v4l2loopback install attempted"
-          sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LO Virtual Camera" || echo "modprobe attempted"
-          sleep 3
-          
-          wget -O sample_image.jpg "https://picsum.photos/1280/720" || true
-          nohup ffmpeg -re -loop 1 -i sample_image.jpg \
-            -f v4l2 -vcodec rawvideo -pix_fmt yuv420p /dev/video10 > ffmpeg.log 2>&1 &
-          
-          adb -s localhost:5555 shell "su -c 'mount --bind /dev/video10 /dev/video0'" || echo "Virtual camera injection attempted"
-          echo "Virtual camera setup attempted"
-
-      - name: Install apps
-        run: |
-          mkdir -p apps
-          cd apps
-          
-          wget -O f-droid.apk "https://f-droid.org/F-Droid.apk" || true
-          wget -O newpipe.apk "https://github.com/TeamNewPipe/NewPipe/releases/download/v0.27.2/NewPipe_v0.27.2.apk" || true
-          
-          for apk in *.apk; do
-            if [ -f "$apk" ]; then
-              adb -s localhost:5555 install "$apk" || echo "Failed to install $apk"
-            fi
-          done
-          
-          echo "Apps installation attempted"
-
-      - name: Setup nginx auth gate
-        env:
-          AUTH_USER: ${{ steps.creds.outputs.USER }}
-          AUTH_PASS: ${{ steps.creds.outputs.PASS }}
-        run: |
-          HASH=$(openssl passwd -apr1 "$AUTH_PASS")
-          echo "$AUTH_USER:$HASH" | sudo tee /etc/nginx/.htpasswd
-          
-          sudo tee /etc/nginx/sites-available/android << 'EOFNG'
-          server {
-            listen 9000;
-            location / {
-              auth_basic "LO Private Android";
-              auth_basic_user_file /etc/nginx/.htpasswd;
-              proxy_pass http://127.0.0.1:8000;
-              proxy_http_version 1.1;
-              proxy_set_header Upgrade $http_upgrade;
-              proxy_set_header Connection "upgrade";
-              proxy_set_header Host $host;
-              proxy_read_timeout 3600s;
-              proxy_send_timeout 3600s;
-            }
-          }
-          EOFNG
-          
-          sudo ln -sf /etc/nginx/sites-available/android /etc/nginx/sites-enabled/android
-          sudo rm -f /etc/nginx/sites-enabled/default
-          sudo nginx -t
-          sudo systemctl restart nginx || sudo service nginx restart || sudo nginx
-          echo "Auth gate ready"
-
-      - name: Start bore tunnel
-        run: |
-          curl -L https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz | tar xz
-          chmod +x bore
-          nohup ./bore local 9000 --to bore.pub --port 0 > bore_out.log 2>&1 &
-          sleep 20
-          echo "Tunnel started"
-
-      - name: Get tunnel and notify
+      - name: Install OpenClaw, lock it, tunnel it, notify LO
+        shell: pwsh
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          USERNAME: ${{ steps.creds.outputs.USER }}
-          PASSWORD: ${{ steps.creds.outputs.PASS }}
         run: |
-          tunnel=$(grep -o 'bore.pub:[0-9]*' bore_out.log | head -1)
-          
-          if [ -z "$tunnel" ]; then
-            echo "Tunnel not ready"
-            cat bore_out.log
-            exit 1
-          fi
-          
-          message="LO Private Android Phone Ready | Address: http://$tunnel | Username: $USERNAME | Password: $PASSWORD | Android: 13 (Redroid) | Control: Browser (scrcpy)"
-          
-          curl -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"$message\"}"
-          
-          echo "Android phone details sent privately"
+          if ([string]::IsNullOrWhiteSpace($env:WEBHOOK_URL)) { Write-Host "Missing webhook"; exit 1 }
 
-      - name: Keep alive
-        run: |
-          sleep 20400
+          $username = -join ((97..122) + (65..90) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          Write-Output "::add-mask::$username"
+          Write-Output "::add-mask::$password"
+
+          Add-MpPreference -ExclusionPath $PWD -ErrorAction SilentlyContinue
+
+          # ---------- 1) OpenClaw ----------
+          Write-Host "Installing OpenClaw..."
+          npm install -g openclaw *> npm_install.log
+          Write-Host "OpenClaw installed"
+
+          Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','openclaw gateway --port 18789 > oc_out.log 2> oc_err.log' -NoNewWindow -WorkingDirectory "$PWD"
+
+          $ocReady = $false
+          for ($i = 1; $i -le 20; $i++) {
+            try {
+              $null = Invoke-WebRequest -Uri 'http://127.0.0.1:18789' -TimeoutSec 3 -UseBasicParsing
+              $ocReady = $true; break
+            } catch {
+              if ($_.Exception.Response) { $ocReady = $true; break }
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $ocReady) {
+            Write-Host "Trying fallback flags..."
+            Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','openclaw gateway --allow-unconfigured > oc_out2.log 2> oc_err2.log' -NoNewWindow -WorkingDirectory "$PWD"
+            for ($i = 1; $i -le 20; $i++) {
+              try {
+                $null = Invoke-WebRequest -Uri 'http://127.0.0.1:18789' -TimeoutSec 3 -UseBasicParsing
+                $ocReady = $true; break
+              } catch {
+                if ($_.Exception.Response) { $ocReady = $true; break }
+              }
+              Start-Sleep -Seconds 3
+            }
+          }
+
+          if (-not $ocReady) {
+            Write-Host "OpenClaw gateway not listening. Debug:"
+            foreach ($f in @('npm_install.log','oc_out.log','oc_err.log','oc_out2.log','oc_err2.log')) {
+              if (Test-Path "$PWD\$f") { Write-Host "=== $f ==="; Get-Content "$PWD\$f" -Tail 25 }
+            }
+            exit 1
+          }
+          Write-Host "OpenClaw gateway listening on 18789"
+
+          # ---------- 2) Caddy (username/password lock) ----------
+          Invoke-WebRequest -Uri 'https://github.com/caddyserver/caddy/releases/download/v2.9.1/caddy_2.9.1_windows_amd64.zip' -OutFile caddy.zip -UseBasicParsing
+          Expand-Archive caddy.zip -DestinationPath ./caddy
+          $caddy = "$PWD\caddy\caddy.exe"
+
+          $hash = (& $caddy hash-password --plaintext $password) 2>$null | Select-Object -Last 1
+          $hash = "$hash".Trim()
+
+          $caddyfile = @"
+          {
+          	admin off
+          }
+          127.0.0.1:8090 {
+          	basicauth {
+          		$username $hash
+          	}
+          	reverse_proxy 127.0.0.1:18789
+          }
+          "@
+          Set-Content -Path "$PWD\Caddyfile" -Value $caddyfile
+
+          Start-Process -FilePath $caddy -ArgumentList 'run','--config',"$PWD\Caddyfile" -RedirectStandardOutput "$PWD\caddy_out.log" -RedirectStandardError "$PWD\caddy_err.log" -NoNewWindow
+          Start-Sleep -Seconds 5
+
+          # ---------- 3) Cloudflare HTTPS tunnel ----------
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile cloudflared.exe -UseBasicParsing
+          Start-Process -FilePath "$PWD\cloudflared.exe" -ArgumentList 'tunnel','--url','http://127.0.0.1:8090' -RedirectStandardOutput "$PWD\cf_out.log" -RedirectStandardError "$PWD\cf_err.log" -NoNewWindow
+
+          $url = $null
+          for ($i = 1; $i -le 24; $i++) {
+            foreach ($f in @('cf_err.log','cf_out.log')) {
+              if (Test-Path "$PWD\$f") {
+                $log = Get-Content "$PWD\$f" -Raw
+                if ($log -match 'https://[a-z0-9-]+\.trycloudflare\.com') { $url = $matches[0]; break }
+              }
+            }
+            if ($url) { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $url) {
+            Write-Host "Tunnel not ready. Debug:"
+            foreach ($f in @('cf_out.log','cf_err.log','caddy_err.log')) {
+              if (Test-Path "$PWD\$f") { Get-Content "$PWD\$f" -Tail 25 }
+            }
+            exit 1
+          }
+
+          # ---------- 4) Optional gateway token (agar UI khud mange) ----------
+          $token = $null
+          foreach ($p in @("$env:USERPROFILE\.openclaw\openclaw.json","$env:USERPROFILE\.config\openclaw\openclaw.json")) {
+            try {
+              $cfg = Get-Content $p -Raw | ConvertFrom-Json
+              if ($cfg.gateway.auth.token) { $token = $cfg.gateway.auth.token; break }
+            } catch {}
+          }
+          if ($token) { Write-Output "::add-mask::$token" }
+
+          # ---------- 5) Discord par bhejo ----------
+          $message = "LO OpenClaw Ready 🔥`nURL: $url`nUsername: $username`nPassword: $password"
+          if ($token) { $message += "`nGateway Token (agar UI mange): $token" }
+          $body = @{ content = $message } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
+          Write-Host "OpenClaw access sent privately."
+
+          # ---------- 6) 6 ghantay zinda ----------
+          for ($i = 0; $i -lt 340; $i++) {
+            Start-Sleep -Seconds 60
+            $alive = (Get-Process -Name cloudflared -ErrorAction SilentlyContinue) -and (Get-Process -Name caddy -ErrorAction SilentlyContinue)
+            if (-not $alive) { Write-Host "Tunnel/proxy died, ending."; break }
+          }
