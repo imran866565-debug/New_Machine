@@ -1,4 +1,4 @@
-name: LO OpenClaw Fortress v3
+name: LO OpenClaw Fortress v4
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
           }
           Write-Host "OpenClaw listening (localhost only)"
 
-          # ---------- 2) Caddy: server-side bcrypt gate ----------
+          # ---------- 2) Caddy: server-side bcrypt gate (plain HTTP, TLS edge par hai) ----------
           Invoke-WebRequest -Uri 'https://github.com/caddyserver/caddy/releases/download/v2.9.1/caddy_2.9.1_windows_amd64.zip' -OutFile caddy.zip -UseBasicParsing
           Expand-Archive caddy.zip -DestinationPath ./caddy
           $caddy = "$PWD\caddy\caddy.exe"
@@ -62,8 +62,8 @@ jobs:
             '{',
             "`tadmin off",
             '}',
-            '127.0.0.1:8090 {',
-            "`tbasicauth {",
+            'http://127.0.0.1:8090 {',
+            "`tbasic_auth {",
             "`t`t$username $hash",
             "`t}",
             "`treverse_proxy 127.0.0.1:18789",
