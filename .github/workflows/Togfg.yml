@@ -1,4 +1,4 @@
-name: LO Private APK Builder
+name: Debug Check Files
 
 on:
   workflow_dispatch:
@@ -6,82 +6,41 @@ on:
 permissions: {}
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     steps:
-      - name: Mask everything sensitive
+      - name: Restore and check files
         shell: bash
         run: |
-          echo "::add-mask::${{ secrets.FG_PAT }}"
-          echo "::add-mask::${{ secrets.PRIVATE_REPO }}"
-          echo "::add-mask::${{ secrets.WEBHOOK_URL }}"
-          echo "::add-mask::${{ secrets.DEBUG_KEYSTORE_B64 }}"
-          echo "::add-mask::${{ secrets.GOOGLE_SERVICES_B64 }}"
-          echo "::add-mask::${{ secrets.DEBUG_KEYSTORE_PASSWORD }}"
-
-      - name: Checkout PRIVATE source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ secrets.PRIVATE_REPO }}
-          token: ${{ secrets.FG_PAT }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Restore sensitive files from secrets
-        shell: bash
-        run: |
-          echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d > ./debug.keystore
-          echo "${{ secrets.GOOGLE_SERVICES_B64 }}" | base64 -d > ./app/google-services.json
-          echo "Sensitive files restored"
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'gradle'
-
-      - name: Build Debug APK
-        env:
-          DEBUG_KEYSTORE_PASSWORD: ${{ secrets.DEBUG_KEYSTORE_PASSWORD }}
-        run: |
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew assembleDebug
-          else
-            gradle assembleDebug
-          fi
-
-      - name: Wipe sensitive files from disk
-        shell: bash
-        if: always()
-        run: |
-          rm -f ./debug.keystore ./app/google-services.json
-          echo "Sensitive files wiped"
-
-      - name: Send APK to private Discord
-        shell: bash
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: |
-          APK=$(ls app/build/outputs/apk/debug/*.apk 2>/dev/null | head -n 1)
-          if [ -z "$APK" ]; then
-            echo "APK not found"; exit 1
-          fi
-          SIZE=$(stat -c%s "$APK")
-          echo "APK size: $SIZE bytes"
-
-          if [ "$SIZE" -gt 24000000 ]; then
-            curl -s -X POST "$WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              -d "{\"content\":\"LO, APK Discord ki 24MB limit se bara hai. Size: $SIZE bytes\"}"
+          echo "=== Checking GOOGLE_SERVICES_B64 ==="
+          B64_LENGTH=${#{{ secrets.GOOGLE_SERVICES_B64 }}}
+          echo "Base64 length: $B64_LENGTH characters"
+          
+          if [ "$B64_LENGTH" -lt 10 ]; then
+            echo "ERROR: Base64 string bahut chota hai - shayad empty ya wrong secret"
             exit 1
           fi
-
-          RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
-            -F "payload_json={\"content\":\"LO APK Ready 🔥 (private build)\"}" \
-            -F "files[0]=@${APK};filename=lo-private-build.apk")
-          echo "Discord response: $RESP"
-          if [ "$RESP" != "204" ]; then exit 1; fi
+          
+          echo "${{ secrets.GOOGLE_SERVICES_B64 }}" | base64 -d > google-services.json
+          
+          echo "=== File size ==="
+          ls -lh google-services.json
+          
+          echo "=== First 5 lines ==="
+          head -n 5 google-services.json
+          
+          echo "=== Checking for project_info ==="
+          if grep -q "project_info" google-services.json; then
+            echo "✅ project_info found"
+          else
+            echo "❌ project_info NOT found - file invalid hai"
+          fi
+          
+          echo "=== Checking JSON validity ==="
+          if jq empty google-services.json 2>/dev/null; then
+            echo "✅ Valid JSON"
+          else
+            echo "❌ Invalid JSON - file corrupt hai"
+            cat google-services.json
+          fi
