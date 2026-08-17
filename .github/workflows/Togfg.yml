@@ -1,4 +1,4 @@
-name: LO Private APK Builder
+name: Check Secret Content
 
 on:
   workflow_dispatch:
@@ -6,91 +6,61 @@ on:
 permissions: {}
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     steps:
-      - name: Checkout PRIVATE source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ secrets.PRIVATE_REPO }}
-          token: ${{ secrets.FG_PAT }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Restore sensitive files (no aggressive masking)
+      - name: Analyze secret safely
         shell: bash
         env:
           GOOGLE_SERVICES_B64: ${{ secrets.GOOGLE_SERVICES_B64 }}
-          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
-          DEBUG_KEYSTORE_PASSWORD: ${{ secrets.DEBUG_KEYSTORE_PASSWORD }}
         run: |
-          # Google services decode
-          echo "$GOOGLE_SERVICES_B64" | base64 -d > ./app/google-services.json
+          echo "=== Secret Analysis ==="
+          echo "Length: ${#GOOGLE_SERVICES_B64} characters"
           
-          if [ ! -s ./app/google-services.json ]; then
-            echo "ERROR: google-services.json empty hai"
+          if [ ${#GOOGLE_SERVICES_B64} -eq 0 ]; then
+            echo "❌ Secret khali hai - kuch paste nahi kiya"
             exit 1
           fi
           
-          if ! grep -q "project_info" ./app/google-services.json; then
-            echo "ERROR: google-services.json invalid hai"
+          if [ ${#GOOGLE_SERVICES_B64} -lt 100 ]; then
+            echo "❌ Secret bahut chota hai - shayad galat content paste kiya"
+            echo "Pehle 50 characters: ${GOOGLE_SERVICES_B64:0:50}"
             exit 1
           fi
           
-          echo "✅ google-services.json valid hai ($(wc -c < ./app/google-services.json) bytes)"
+          echo "First 50 chars: ${GOOGLE_SERVICES_B64:0:50}..."
+          echo "Last 50 chars: ...${GOOGLE_SERVICES_B64: -50}"
           
-          # Keystore decode
-          echo "$DEBUG_KEYSTORE_B64" | base64 -d > ./debug.keystore
-          echo "✅ debug.keystore restored ($(wc -c < ./debug.keystore) bytes)"
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'gradle'
-
-      - name: Build Debug APK
-        env:
-          DEBUG_KEYSTORE_PASSWORD: ${{ secrets.DEBUG_KEYSTORE_PASSWORD }}
-        run: |
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew assembleDebug
+          echo ""
+          echo "=== Attempting decode ==="
+          echo "$GOOGLE_SERVICES_B64" | base64 -d > test.json 2>decode_error.txt
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Base64 decode fail - invalid base64 string"
+            cat decode_error.txt
+            exit 1
+          fi
+          
+          echo "Decoded file size: $(wc -c < test.json) bytes"
+          
+          if [ ! -s test.json ]; then
+            echo "❌ Decoded file khali hai"
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== First 200 chars of decoded file ==="
+          head -c 200 test.json
+          echo ""
+          echo "=== End of preview ==="
+          
+          echo ""
+          echo "=== Checking JSON structure ==="
+          if grep -q "project_info" test.json; then
+            echo "✅ project_info found"
           else
-            gradle assembleDebug
+            echo "❌ project_info NOT found"
+            echo "File content preview:"
+            cat test.json | head -c 500
           fi
-
-      - name: Wipe sensitive files from disk
-        shell: bash
-        if: always()
-        run: |
-          rm -f ./debug.keystore ./app/google-services.json
-          echo "✅ Sensitive files wiped"
-
-      - name: Send APK to private Discord
-        shell: bash
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: |
-          APK=$(ls app/build/outputs/apk/debug/*.apk 2>/dev/null | head -n 1)
-          if [ -z "$APK" ]; then
-            echo "APK not found"; exit 1
-          fi
-          SIZE=$(stat -c%s "$APK")
-          echo "APK size: $SIZE bytes"
-
-          if [ "$SIZE" -gt 24000000 ]; then
-            curl -s -X POST "$WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              -d "{\"content\":\"LO, APK Discord ki 24MB limit se bara hai. Size: $SIZE bytes\"}"
-            exit 1
-          fi
-
-          RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
-            -F "payload_json={\"content\":\"LO APK ready 🔥\"}" \
-            -F "files[0]=@${APK};filename=lo-private-build.apk")
-          echo "Discord response: $RESP"
-          if [ "$RESP" != "204" ]; then exit 1; fi
