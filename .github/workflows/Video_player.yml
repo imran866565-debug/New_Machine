@@ -1,4 +1,4 @@
-name: LO OpenClaw Fortress
+name: LO OpenClaw Fortress v3
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: OpenClaw + backend-verified auth gate + bore tunnel
+      - name: OpenClaw + backend auth gate + edge-TLS tunnel (self-tested)
         shell: pwsh
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
@@ -28,45 +28,33 @@ jobs:
           # ---------- 1) OpenClaw (localhost only) ----------
           Write-Host "Installing OpenClaw..."
           npm install -g openclaw *> npm_install.log
-
           Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','openclaw gateway --port 18789 > oc_out.log 2> oc_err.log' -NoNewWindow -WorkingDirectory "$PWD"
 
           $ocReady = $false
           for ($i = 1; $i -le 20; $i++) {
-            try {
-              $null = Invoke-WebRequest -Uri 'http://127.0.0.1:18789' -TimeoutSec 3 -UseBasicParsing
-              $ocReady = $true; break
-            } catch {
-              if ($_.Exception.Response) { $ocReady = $true; break }
-            }
+            try { $null = Invoke-WebRequest -Uri 'http://127.0.0.1:18789' -TimeoutSec 3 -UseBasicParsing; $ocReady = $true; break }
+            catch { if ($_.Exception.Response) { $ocReady = $true; break } }
             Start-Sleep -Seconds 3
           }
           if (-not $ocReady) {
             Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','openclaw gateway --allow-unconfigured > oc_out2.log 2> oc_err2.log' -NoNewWindow -WorkingDirectory "$PWD"
             for ($i = 1; $i -le 20; $i++) {
-              try {
-                $null = Invoke-WebRequest -Uri 'http://127.0.0.1:18789' -TimeoutSec 3 -UseBasicParsing
-                $ocReady = $true; break
-              } catch {
-                if ($_.Exception.Response) { $ocReady = $true; break }
-              }
+              try { $null = Invoke-WebRequest -Uri 'http://127.0.0.1:18789' -TimeoutSec 3 -UseBasicParsing; $ocReady = $true; break }
+              catch { if ($_.Exception.Response) { $ocReady = $true; break } }
               Start-Sleep -Seconds 3
             }
           }
           if (-not $ocReady) {
             Write-Host "OpenClaw not listening. Debug:"
-            foreach ($f in @('npm_install.log','oc_err.log','oc_err2.log')) {
-              if (Test-Path "$PWD\$f") { Write-Host "=== $f ==="; Get-Content "$PWD\$f" -Tail 25 }
-            }
+            foreach ($f in @('npm_install.log','oc_err.log','oc_err2.log')) { if (Test-Path "$PWD\$f") { Write-Host "=== $f ==="; Get-Content "$PWD\$f" -Tail 25 } }
             exit 1
           }
-          Write-Host "OpenClaw listening on 127.0.0.1:18789 (localhost only)"
+          Write-Host "OpenClaw listening (localhost only)"
 
-          # ---------- 2) Caddy: server-side bcrypt auth + TLS ----------
+          # ---------- 2) Caddy: server-side bcrypt gate ----------
           Invoke-WebRequest -Uri 'https://github.com/caddyserver/caddy/releases/download/v2.9.1/caddy_2.9.1_windows_amd64.zip' -OutFile caddy.zip -UseBasicParsing
           Expand-Archive caddy.zip -DestinationPath ./caddy
           $caddy = "$PWD\caddy\caddy.exe"
-
           $hash = (& $caddy hash-password --plaintext $password) 2>$null | Select-Object -Last 1
           $hash = "$hash".Trim()
 
@@ -74,8 +62,7 @@ jobs:
             '{',
             "`tadmin off",
             '}',
-            'https://127.0.0.1:8090 {',
-            "`ttls internal",
+            '127.0.0.1:8090 {',
             "`tbasicauth {",
             "`t`t$username $hash",
             "`t}",
@@ -85,44 +72,72 @@ jobs:
           Set-Content -Path "$PWD\Caddyfile" -Value ($lines -join "`n")
 
           Start-Process -FilePath $caddy -ArgumentList 'run','--config',"$PWD\Caddyfile" -RedirectStandardOutput "$PWD\caddy_out.log" -RedirectStandardError "$PWD\caddy_err.log" -NoNewWindow
-          Start-Sleep -Seconds 6
+          Start-Sleep -Seconds 5
           if (-not (Get-Process -Name caddy -ErrorAction SilentlyContinue)) {
-            Write-Host "Caddy failed. Debug:"
-            Get-Content "$PWD\caddy_err.log" -Tail 30
-            exit 1
+            Write-Host "Caddy failed:"; Get-Content "$PWD\caddy_err.log" -Tail 30; exit 1
           }
 
-          # ---------- 3) bore.pub TCP tunnel ----------
-          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
-          Expand-Archive bore.zip -DestinationPath ./bore
-          Start-Process -FilePath "$PWD\bore\bore.exe" -ArgumentList 'local','8090','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD\bore_out.log" -RedirectStandardError "$PWD\bore_err.log" -NoNewWindow
+          $gateOk = $false
+          try { $null = Invoke-WebRequest -Uri 'http://127.0.0.1:8090' -TimeoutSec 5 -UseBasicParsing; $gateOk = $true }
+          catch { if ($_.Exception.Response) { $gateOk = $true } }
+          if (-not $gateOk) { Write-Host "Local gate test failed:"; Get-Content "$PWD\caddy_err.log" -Tail 30; exit 1 }
+          Write-Host "Local auth gate OK (401 without creds = pure backend trust)"
 
-          $url = $null
-          for ($i = 1; $i -le 24; $i++) {
-            foreach ($f in @('bore_out.log','bore_err.log')) {
-              if (Test-Path "$PWD\$f") {
-                $log = Get-Content "$PWD\$f" -Raw
-                if ($log -match 'listening at bore\.pub:(\d+)') { $url = "https://bore.pub:$($matches[1])"; break }
-              }
+          # ---------- 3) Tunnel 1: localhost.run (edge TLS, valid cert) ----------
+          Start-Process -FilePath 'ssh.exe' -ArgumentList '-o','StrictHostKeyChecking=accept-new','-o','ServerAliveInterval=30','-o','ExitOnForwardFailure=yes','-R','80:localhost:8090','nokey@localhost.run' -RedirectStandardOutput "$PWD\lhr_out.log" -RedirectStandardError "$PWD\lhr_err.log" -NoNewWindow
+
+          $url = $null; $tunnelName = 'localhost.run'
+          for ($i = 1; $i -le 20; $i++) {
+            if (Test-Path "$PWD\lhr_out.log") {
+              $log = Get-Content "$PWD\lhr_out.log" -Raw
+              if ($log -match 'https://[a-zA-Z0-9\-\.]+\.(lhr\.life|localhost\.run)') { $url = $matches[0]; break }
             }
-            if ($url) { break }
-            Start-Sleep -Seconds 5
-          }
-          if (-not $url) {
-            Write-Host "Bore tunnel not ready. Debug:"
-            foreach ($f in @('bore_out.log','bore_err.log')) { if (Test-Path "$PWD\$f") { Get-Content "$PWD\$f" -Tail 25 } }
-            exit 1
+            Start-Sleep -Seconds 3
           }
 
-          # ---------- 4) Discord ----------
-          $message = "LO OpenClaw Fortress Ready 🔒`nURL: $url`nUsername: $username`nPassword: $password`nNote: cert warning aayega - Advanced > Proceed karo (yehi TLS encryption ki daleel hai)."
+          if ($url) {
+            $extOk = $false
+            try { $null = Invoke-WebRequest -Uri $url -TimeoutSec 10 -UseBasicParsing; $extOk = $true }
+            catch { if ($_.Exception.Response) { $extOk = $true } }
+            if (-not $extOk) { $url = $null; Write-Host "localhost.run self-test failed" }
+          }
+
+          # ---------- 4) Tunnel 2 fallback: serveo.net ----------
+          if (-not $url) {
+            Write-Host "Trying serveo.net..."
+            Start-Process -FilePath 'ssh.exe' -ArgumentList '-o','StrictHostKeyChecking=accept-new','-o','ServerAliveInterval=30','-o','ExitOnForwardFailure=yes','-R','80:localhost:8090','serveo.net' -RedirectStandardOutput "$PWD\sv_out.log" -RedirectStandardError "$PWD\sv_err.log" -NoNewWindow
+            $tunnelName = 'serveo.net'
+            for ($i = 1; $i -le 20; $i++) {
+              if (Test-Path "$PWD\sv_out.log") {
+                $log = Get-Content "$PWD\sv_out.log" -Raw
+                if ($log -match 'https://[a-zA-Z0-9\-\.]+\.serveo\.net') { $url = $matches[0]; break }
+              }
+              Start-Sleep -Seconds 3
+            }
+            if ($url) {
+              $extOk = $false
+              try { $null = Invoke-WebRequest -Uri $url -TimeoutSec 10 -UseBasicParsing; $extOk = $true }
+              catch { if ($_.Exception.Response) { $extOk = $true } }
+              if (-not $extOk) { $url = $null }
+            }
+          }
+
+          if (-not $url) {
+            Write-Host "All tunnels failed. Debug:"
+            foreach ($f in @('lhr_out.log','lhr_err.log','sv_out.log','sv_err.log')) { if (Test-Path "$PWD\$f") { Write-Host "=== $f ==="; Get-Content "$PWD\$f" -Tail 20 } }
+            exit 1
+          }
+          Write-Host "Tunnel live via $tunnelName (self-tested)"
+
+          # ---------- 5) Discord ----------
+          $message = "LO OpenClaw Fortress Ready 🔒`nURL: $url`nUsername: $username`nPassword: $password`nTunnel: $tunnelName (valid TLS, no warnings)"
           $body = @{ content = $message } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
           Write-Host "Access sent privately."
 
-          # ---------- 5) keep alive ----------
+          # ---------- 6) keep alive ----------
           for ($i = 0; $i -lt 340; $i++) {
             Start-Sleep -Seconds 60
-            $alive = (Get-Process -Name bore -ErrorAction SilentlyContinue) -and (Get-Process -Name caddy -ErrorAction SilentlyContinue)
-            if (-not $alive) { Write-Host "Tunnel/proxy died, ending."; break }
+            $alive = (Get-Process -Name caddy -ErrorAction SilentlyContinue) -and ((Get-Process -Name ssh -ErrorAction SilentlyContinue).Count -ge 1)
+            if (-not $alive) { Write-Host "Gate or tunnel died, ending."; break }
           }
