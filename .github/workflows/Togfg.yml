@@ -1,4 +1,4 @@
-name: LO Ultra Secure RDP (Final Hardened)
+name: LO Private APK Builder
 
 on:
   workflow_dispatch:
@@ -6,124 +6,62 @@ on:
 permissions: {}
 
 jobs:
-  rdp:
-    runs-on: windows-latest
-    timeout-minutes: 360
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-      - name: Create random admin credentials
-        id: creds
-        shell: pwsh
+      - name: Mask everything sensitive
+        shell: bash
         run: |
-          $username = -join ((97..122) + (65..90) | Get-Random -Count 16 | ForEach-Object {[char]$_})
-          $password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
-          
-          Write-Output "::add-mask::$username"
-          Write-Output "::add-mask::$password"
-          
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "USER=$username"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "PASS=$password"
-          
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $username -Password $secure
-          Add-LocalGroupMember -Group Administrators -Member $username
-          
-          Write-Host "Random admin created (username masked)"
+          echo "::add-mask::${{ secrets.FG_PAT }}"
+          echo "::add-mask::${{ secrets.PRIVATE_REPO }}"
+          echo "::add-mask::${{ secrets.WEBHOOK_URL }}"
 
-      - name: Enable RDP with NLA
-        shell: pwsh
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.FG_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build Debug APK
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
-          Start-Service -Name 'TermService' -ErrorAction SilentlyContinue
-          New-NetFirewallRule -DisplayName "Allow RDP Inbound" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug
+          else
+            gradle assembleDebug
+          fi
 
-      - name: Verify bore binary integrity
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
-          Expand-Archive bore.zip -DestinationPath ./bore
-          $exe = Join-Path $PWD 'bore/bore.exe'
-          
-          # Hash verification (no Defender exclusion needed anymore)
-          $expected = 'E5D3F5B9D7E2C3A6F4C5D8B9E7A1C3F2D4E6B8A0C1D3E5F7A9B1C3D5E7F9A0B2'
-          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash
-          Write-Host "Bore binary hash: $actual"
-          Write-Host "Binary downloaded and extracted"
-
-      - name: Start tunnel and send credentials
-        shell: pwsh
+      - name: Send APK to private Discord
+        shell: bash
         env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          LO_USER: ${{ steps.creds.outputs.USER }}
-          LO_PASS: ${{ steps.creds.outputs.PASS }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:BOT_TOKEN)) { Write-Host "Missing bot token"; exit 1 }
-          if ([string]::IsNullOrWhiteSpace($env:CHANNEL_ID)) { Write-Host "Missing channel ID"; exit 1 }
-          if ([string]::IsNullOrWhiteSpace($env:LO_USER)) { Write-Host "Missing username"; exit 1 }
-          if ([string]::IsNullOrWhiteSpace($env:LO_PASS)) { Write-Host "Missing password"; exit 1 }
+          APK=$(ls app/build/outputs/apk/debug/*.apk 2>/dev/null | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "APK not found"; exit 1
+          fi
+          SIZE=$(stat -c%s "$APK")
+          echo "APK size: $SIZE bytes"
 
-          $exe = Join-Path $PWD 'bore/bore.exe'
-
-          Start-Process -FilePath $exe -ArgumentList 'local','3389','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD\bore_out.log" -RedirectStandardError "$PWD\bore_err.log" -NoNewWindow
-          Start-Sleep -Seconds 15
-
-          $tunnel = $null
-          for ($i = 1; $i -le 24; $i++) {
-            if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) {
-              Write-Host "Bore process died"
-              if (Test-Path "$PWD\bore_err.log") { Get-Content "$PWD\bore_err.log" -Tail 20 }
-              exit 1
-            }
-            foreach ($f in @("$PWD\bore_out.log", "$PWD\bore_err.log")) {
-              if (Test-Path $f) {
-                $log = Get-Content $f -Raw
-                if ($log -match 'listening at bore\.pub:(\d+)') {
-                  $tunnel = "bore.pub:$($matches[1])"
-                  break
-                }
-              }
-            }
-            if ($tunnel) { break }
-            Start-Sleep -Seconds 5
-          }
-
-          if (-not $tunnel) {
-            Write-Host "Tunnel not ready"
+          if [ "$SIZE" -gt 24000000 ]; then
+            curl -s -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"content\":\"LO, APK Discord ki 24MB limit se bara hai. Size: $SIZE bytes\"}"
             exit 1
-          }
+          fi
 
-          # FIXED: Use $env:LO_USER instead of $env:USERNAME
-          $message = "🔥 LO Private RDP Ready 🔥`n`n" + `
-                     "📍 Address: $tunnel`n" + `
-                     "👤 Username: $env:LO_USER`n" + `
-                     "🔑 Password: $env:LO_PASS`n`n" + `
-                     "⏰ Valid 6h, auto-destructs`n" + `
-                     "🔒 NLA Enabled"
-
-          $telegramUrl = "https://api.telegram.org/bot$env:BOT_TOKEN/sendMessage"
-          $body = @{
-              chat_id = $env:CHANNEL_ID
-              text = $message
-              disable_web_page_preview = $true
-          }
-
-          try {
-              $response = Invoke-RestMethod -Uri $telegramUrl -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
-              Write-Host "Credentials sent successfully (username FIXED)"
-          } catch {
-              Write-Host "Telegram failed: $_"
-              exit 1
-          }
-
-          # Keep alive
-          $start = Get-Date
-          while (((Get-Date) - $start).TotalHours -lt 5.8) {
-            Start-Sleep -Seconds 60
-            if (-not (Get-Process -Name bore -ErrorAction SilentlyContinue)) {
-              Write-Host "Bore died, ending early"
-              break
-            }
-          }
+          RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+            -F "payload_json={\"content\":\"LO APK Ready 🔥 (private build)\"}" \
+            -F "files[0]=@${APK};filename=lo-private-build.apk")
+          echo "Discord response: $RESP"
+          if [ "$RESP" != "204" ]; then exit 1; fi
